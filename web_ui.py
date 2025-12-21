@@ -14,30 +14,25 @@ from conf.config import Config
 
 # ================= 1. 全局配置与生命周期管理 =================
 
-# 定义一个专属的临时上传目录，方便管理和清理
+# 定义一个专属的临时上传目录
 TEMP_UPLOAD_DIR = os.path.join(Config.BASE_DIR, "temp_uploads")
 
 
 @st.cache_resource
 def init_application():
     """
-    [关键优化 3] 应用启动初始化函数
-    只在服务器启动时执行一次，用于清理上次残留的僵尸文件
+    应用启动初始化：清理旧的僵尸文件
     """
     if os.path.exists(TEMP_UPLOAD_DIR):
         try:
-            # 暴力清空整个文件夹，确保无残留
             shutil.rmtree(TEMP_UPLOAD_DIR)
             logger.info("🧹 启动自检：已清理旧的临时文件目录。")
         except Exception as e:
             logger.error(f"清理临时目录失败: {e}")
-
-    # 重建目录
     os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
     return True
 
 
-# 执行初始化
 init_application()
 
 st.set_page_config(
@@ -73,26 +68,35 @@ if "bot" not in st.session_state:
 def save_uploaded_file(uploaded_file):
     """保存文件到专属临时目录"""
     try:
-        # 使用 uuid 防止文件名冲突 (解决竞争条件)
-        file_ext = os.path.splitext(uploaded_file.name)[1]
+        # 使用 uuid 防止文件名冲突
         unique_name = f"{uuid.uuid4().hex}_{uploaded_file.name}"
         save_path = os.path.join(TEMP_UPLOAD_DIR, unique_name)
-
         with open(save_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
-
-        return save_path
+        # 返回路径和原始文件名
+        return {"path": save_path, "name": uploaded_file.name}
     except Exception as e:
         st.error(f"文件写入失败: {e}")
         return None
 
 
 def parse_file_safe(file_path, original_name, limit):
-    """封装解析器，用于线程池调用"""
+    """封装解析器"""
     try:
         return FileParser.parse(file_path, max_chars=limit, original_filename=original_name)
     except Exception as e:
         return f"\n[解析异常 {original_name}: {e}]\n"
+
+
+def cleanup_temp_files(file_objs):
+    """清理临时文件"""
+    if not file_objs: return
+    for item in file_objs:
+        try:
+            if os.path.exists(item['path']):
+                os.remove(item['path'])
+        except Exception as e:
+            logger.warning(f"清理失败: {e}")
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -176,7 +180,6 @@ for msg in st.session_state.messages:
 
 with st.popover("📎 挂载文件", use_container_width=True):
     st.markdown("### 📂 文件上传")
-    st.caption("支持格式: 图片、PDF、Excel、PPT、XMind、代码文件")
     uploaded_files = st.file_uploader(
         "选择文件", accept_multiple_files=True, label_visibility="collapsed",
         key=f"uploader_{st.session_state.uploader_key}",
@@ -187,9 +190,8 @@ with st.popover("📎 挂载文件", use_container_width=True):
     if uploaded_files:
         file_objs = []
         for f in uploaded_files:
-            p = save_uploaded_file(f)
-            if p:
-                file_objs.append({"path": p, "name": f.name})
+            res = save_uploaded_file(f)
+            if res: file_objs.append(res)
         if file_objs:
             st.session_state.files_to_send = file_objs
             st.success(f"已就绪 {len(file_objs)} 个文件")
@@ -197,22 +199,43 @@ with st.popover("📎 挂载文件", use_container_width=True):
 if st.session_state.files_to_send:
     st.info(f"📎 待发送: {len(st.session_state.files_to_send)} 个文件", icon="📌")
 
-# ================= 6. 发送逻辑 (核心优化区) =================
-if prompt := st.chat_input("请输入..."):
+# ================= 6. 输入与发送逻辑 (含一键分析) =================
+
+# 状态检查
+has_files = len(st.session_state.files_to_send) > 0
+manual_trigger = False  # 是否点击了手动发送按钮
+
+# 如果有文件，显示一个“一键分析”按钮
+if has_files:
+    cols = st.columns([0.85, 0.15])
+    with cols[1]:
+        if st.button("📤 立即分析文件", use_container_width=True, type="primary"):
+            manual_trigger = True
+
+# 聊天输入框
+user_input = st.chat_input("请输入... (或者点击上方按钮直接分析文件)")
+
+# 触发条件：有输入文字 OR (有文件且点击了按钮)
+if user_input or (has_files and manual_trigger):
+
+    # 确定 Prompt：如果有输入则用输入，否则用默认提示词
+    final_prompt = user_input if user_input else "请详细分析以上上传的文件内容，并提取关键信息。"
+
     with st.chat_message("user"):
-        st.markdown(prompt)
-    st.session_state.messages.append({"role": "user", "content": prompt})
+        st.markdown(final_prompt)
+    st.session_state.messages.append({"role": "user", "content": final_prompt})
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
         full_res = ""
         status = st.status("正在处理...", expanded=True)
 
+        current_temp_files = []
+
         try:
-            current_files = []
             if st.session_state.files_to_send:
-                current_files = st.session_state.files_to_send.copy()
-            st.session_state.files_to_send = []
+                current_temp_files = st.session_state.files_to_send.copy()
+            st.session_state.files_to_send = []  # 清空UI状态
 
             media_files = []
             doc_files_to_parse = []
@@ -220,37 +243,27 @@ if prompt := st.chat_input("请输入..."):
             MEDIA_EXTS = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp3', '.mp4']
 
             # 1. 快速分类
-            for f_obj in current_files:
+            for f_obj in current_temp_files:
                 ext = os.path.splitext(f_obj['path'])[1].lower()
                 if ext in MEDIA_EXTS:
-                    media_files.append(f_obj['path'])  # 图片直接传路径
+                    media_files.append(f_obj['path'])
                 else:
                     doc_files_to_parse.append(f_obj)
 
-            # 2. [关键优化 1] 并行解析文档
+            # 2. 并行解析文档
             if doc_files_to_parse:
                 status.write(f"⚡️ 正在并行解析 {len(doc_files_to_parse)} 个文档...")
                 max_chars = st.session_state.config_max_chars
 
-                # 使用线程池并发处理
                 with ThreadPoolExecutor(max_workers=4) as executor:
-                    # 提交任务
                     future_to_file = {
-                        executor.submit(
-                            parse_file_safe,
-                            f['path'],
-                            f['name'],
-                            max_chars  # 这里传入每个文件的上限，防止单个文件爆内存
-                        ): f['name']
+                        executor.submit(parse_file_safe, f['path'], f['name'], max_chars): f['name']
                         for f in doc_files_to_parse
                     }
-
-                    # 获取结果
                     for future in as_completed(future_to_file):
                         fname = future_to_file[future]
                         try:
                             result = future.result()
-                            # [安全截断] 累加前检查总长度
                             if len(text_context) + len(result) > max_chars:
                                 status.warning(f"⚠️ 总文本量超限，文件 {fname} 及后续内容已截断。")
                                 text_context += result[:(max_chars - len(text_context))]
@@ -264,19 +277,10 @@ if prompt := st.chat_input("请输入..."):
                     with st.container(height=200):
                         st.code(text_context, language="markdown")
 
-            # 3. [关键优化 2] 结构化 Prompt 拼接
-            # 使用 XML 标签明确区分“参考资料”和“用户指令”
-            final_query = prompt
+            # 3. 结构化 Prompt
+            final_query = final_prompt
             if text_context:
-                final_query = f"""
-<context>
-{text_context}
-</context>
-
-<instruction>
-{prompt}
-</instruction>
-"""
+                final_query = f"<context>\n{text_context}\n</context>\n\n<instruction>\n{final_prompt}\n</instruction>"
 
             # 4. 上传多媒体
             final_files_payload = []
@@ -312,10 +316,6 @@ if prompt := st.chat_input("请输入..."):
             placeholder.markdown(full_res)
             st.session_state.messages.append({"role": "assistant", "content": full_res})
 
-            # 显示复制按钮
-            with st.expander("📄 复制全文", expanded=False):
-                st.code(full_res, language="markdown")
-
             st.session_state.uploader_key += 1
             time.sleep(0.5)
             st.rerun()
@@ -323,3 +323,7 @@ if prompt := st.chat_input("请输入..."):
         except Exception as e:
             st.error(f"Error: {e}")
             logger.error(f"UI Error: {e}", exc_info=True)
+
+        finally:
+            if current_temp_files:
+                cleanup_temp_files(current_temp_files)
