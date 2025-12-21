@@ -1,8 +1,10 @@
 # web_ui.py
 import streamlit as st
 import os
-import tempfile
-import time  # 用于延时
+import time
+import shutil
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 导入业务层
 from PageObject.dify_service import DifyService
@@ -10,11 +12,39 @@ from utils.logger import logger
 from utils.file_parser import FileParser
 from conf.config import Config
 
-# ================= 1. 页面配置 =================
+# ================= 1. 全局配置与生命周期管理 =================
+
+# 定义一个专属的临时上传目录，方便管理和清理
+TEMP_UPLOAD_DIR = os.path.join(Config.BASE_DIR, "temp_uploads")
+
+
+@st.cache_resource
+def init_application():
+    """
+    [关键优化 3] 应用启动初始化函数
+    只在服务器启动时执行一次，用于清理上次残留的僵尸文件
+    """
+    if os.path.exists(TEMP_UPLOAD_DIR):
+        try:
+            # 暴力清空整个文件夹，确保无残留
+            shutil.rmtree(TEMP_UPLOAD_DIR)
+            logger.info("🧹 启动自检：已清理旧的临时文件目录。")
+        except Exception as e:
+            logger.error(f"清理临时目录失败: {e}")
+
+    # 重建目录
+    os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+    return True
+
+
+# 执行初始化
+init_application()
+
 st.set_page_config(
-    page_title="Dify 全能助手 (Pro)",
+    page_title="Dify 全能助手 (Ultra)",
     page_icon="🚀",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 # ================= 2. Session 初始化 =================
@@ -26,6 +56,8 @@ if "files_to_send" not in st.session_state:
     st.session_state.files_to_send = []
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
+if "config_max_chars" not in st.session_state:
+    st.session_state.config_max_chars = getattr(Config, 'MAX_CONTEXT_CHARS', 30000)
 
 if "bot" not in st.session_state:
     try:
@@ -36,143 +68,229 @@ if "bot" not in st.session_state:
         st.error(f"连接失败: {e}")
 
 
-# ================= 3. 辅助函数 =================
+# ================= 3. 核心工具函数 =================
 
 def save_uploaded_file(uploaded_file):
-    """保存临时文件"""
+    """保存文件到专属临时目录"""
     try:
+        # 使用 uuid 防止文件名冲突 (解决竞争条件)
         file_ext = os.path.splitext(uploaded_file.name)[1]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            return tmp_file.name
+        unique_name = f"{uuid.uuid4().hex}_{uploaded_file.name}"
+        save_path = os.path.join(TEMP_UPLOAD_DIR, unique_name)
+
+        with open(save_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+
+        return save_path
     except Exception as e:
-        st.error(f"保存失败: {e}")
+        st.error(f"文件写入失败: {e}")
         return None
 
 
-@st.cache_data(show_spinner=False)
-def cached_parse_file(file_path):
-    return FileParser.parse(file_path)
+def parse_file_safe(file_path, original_name, limit):
+    """封装解析器，用于线程池调用"""
+    try:
+        return FileParser.parse(file_path, max_chars=limit, original_filename=original_name)
+    except Exception as e:
+        return f"\n[解析异常 {original_name}: {e}]\n"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_cached_conversations(_bot, limit=20):
+    return _bot.get_conversations(limit=limit)
+
+
+def load_history_session(conv_id):
+    """加载历史会话"""
+    try:
+        st.session_state.conversation_id = conv_id
+        st.session_state.messages = []
+        history = st.session_state.bot.get_history_messages(conversation_id=conv_id, limit=100)
+        for item in reversed(history.get('data', [])):
+            if item.get('query'):
+                st.session_state.messages.append({"role": "user", "content": item.get('query')})
+            if item.get('answer'):
+                st.session_state.messages.append({"role": "assistant", "content": item.get('answer')})
+        st.session_state.files_to_send = []
+        st.session_state.uploader_key += 1
+    except Exception as e:
+        st.error(f"加载历史失败: {e}")
 
 
 # ================= 4. 侧边栏 =================
 with st.sidebar:
-    st.title("🛠️ 控制台")
-    st.caption(
-        f"Session: {st.session_state.conversation_id[:8]}..." if st.session_state.conversation_id else "Session: New")
+    st.title("🗂️ 历史会话")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        if st.button("➕ 新对话", use_container_width=True, type="primary"):
+            st.session_state.conversation_id = ""
+            st.session_state.messages = []
+            st.session_state.files_to_send = []
+            st.session_state.uploader_key += 1
+            st.rerun()
+    with col2:
+        if st.button("🔄", use_container_width=True):
+            get_cached_conversations.clear()
+            st.rerun()
 
-    if st.button("🗑️ 新开对话", use_container_width=True):
-        st.session_state.conversation_id = ""
-        st.session_state.messages = []
-        st.session_state.files_to_send = []
-        st.session_state.uploader_key += 1
-        st.rerun()
+    st.markdown("---")
+    try:
+        if "bot" in st.session_state:
+            conv_list = get_cached_conversations(st.session_state.bot, limit=20)
+            data_list = conv_list.get('data', [])
+            if not data_list:
+                st.caption("暂无历史记录")
+            else:
+                for conv in data_list:
+                    c_id = conv.get('id')
+                    c_name = conv.get('name', '未命名会话')
+                    is_active = (c_id == st.session_state.conversation_id)
+                    label = f"🟢 {c_name}" if is_active else f"💬 {c_name}"
+                    if st.button(label, key=c_id, use_container_width=True):
+                        load_history_session(c_id)
+                        st.rerun()
+    except Exception as e:
+        st.warning("获取列表失败")
 
     st.divider()
-    st.markdown("### ⚙️ 高级设置")
-    dynamic_max_chars = st.slider(
-        "单次文档字数限制",
-        min_value=10000,
-        max_value=500000,
-        value=getattr(Config, 'MAX_CONTEXT_CHARS', 30000),
-        step=10000,
-        help="控制本地解析文档后发送给 AI 的最大长度，防止 Token 溢出。"
-    )
+    with st.expander("⚙️ 高级设置"):
+        st.session_state.config_max_chars = st.slider(
+            "文档截断长度",
+            min_value=10000, max_value=500000,
+            value=st.session_state.config_max_chars, step=10000
+        )
+        st.caption(f"Session: {st.session_state.conversation_id}")
 
 # ================= 5. 主界面 =================
 st.subheader("💬 Dify 全能助手")
 
-# A. 渲染历史消息
+if not st.session_state.messages:
+    st.info("👋 支持 PDF/Excel/PPT/XMind 并行解析与多轮对话。", icon="✨")
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-
-        # [优化点 1] 为历史回复增加复制按钮 (仅针对 AI 回复)
         if msg["role"] == "assistant":
-            with st.expander("📄 复制 Markdown 源码", expanded=False):
+            with st.expander("📄 复制 Markdown", expanded=False):
                 st.code(msg["content"], language="markdown")
 
-# B. 文件上传区
 with st.popover("📎 挂载文件", use_container_width=True):
-    st.markdown("### 📂 支持格式")
-    st.info("💡 图片直接上传；文档(PDF/Office/Code)自动解析转文字。")
-
+    st.markdown("### 📂 文件上传")
+    st.caption("支持格式: 图片、PDF、Excel、PPT、XMind、代码文件")
     uploaded_files = st.file_uploader(
-        "选择或粘贴文件 (Ctrl+V)",
-        accept_multiple_files=True,
-        label_visibility="collapsed",
+        "选择文件", accept_multiple_files=True, label_visibility="collapsed",
         key=f"uploader_{st.session_state.uploader_key}",
         type=['png', 'jpg', 'jpeg', 'webp', 'gif', 'mp3', 'mp4',
               'pdf', 'pptx', 'xlsx', 'xls', 'xmind',
               'txt', 'md', 'py', 'java', 'js', 'html', 'css', 'json', 'csv', 'sql', 'sh']
     )
-
     if uploaded_files:
-        paths = []
+        file_objs = []
         for f in uploaded_files:
             p = save_uploaded_file(f)
-            if p: paths.append(p)
-        if paths:
-            st.session_state.files_to_send = paths
-            st.success(f"已就绪 {len(paths)} 个文件")
+            if p:
+                file_objs.append({"path": p, "name": f.name})
+        if file_objs:
+            st.session_state.files_to_send = file_objs
+            st.success(f"已就绪 {len(file_objs)} 个文件")
 
 if st.session_state.files_to_send:
     st.info(f"📎 待发送: {len(st.session_state.files_to_send)} 个文件", icon="📌")
 
-# C. 输入与发送
+# ================= 6. 发送逻辑 (核心优化区) =================
 if prompt := st.chat_input("请输入..."):
-    # 1. 用户消息
     with st.chat_message("user"):
         st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # 2. AI 回复
     with st.chat_message("assistant"):
         placeholder = st.empty()
         full_res = ""
         status = st.status("正在处理...", expanded=True)
 
         try:
-            # === 文件预处理 ===
+            current_files = []
+            if st.session_state.files_to_send:
+                current_files = st.session_state.files_to_send.copy()
+            st.session_state.files_to_send = []
+
             media_files = []
+            doc_files_to_parse = []
             text_context = ""
             MEDIA_EXTS = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp3', '.mp4']
 
-            for path in st.session_state.files_to_send:
-                ext = os.path.splitext(path)[1].lower()
+            # 1. 快速分类
+            for f_obj in current_files:
+                ext = os.path.splitext(f_obj['path'])[1].lower()
                 if ext in MEDIA_EXTS:
-                    media_files.append(path)
+                    media_files.append(f_obj['path'])  # 图片直接传路径
                 else:
-                    status.write(f"📄 解析文档: {os.path.basename(path)}")
-                    text_context += cached_parse_file(path)
+                    doc_files_to_parse.append(f_obj)
 
-            # Token 截断
-            if len(text_context) > dynamic_max_chars:
-                status.warning(f"⚠️ 文档过长，已截断至 {dynamic_max_chars} 字。")
-                text_context = text_context[:dynamic_max_chars] + "\n\n...[截断]..."
+            # 2. [关键优化 1] 并行解析文档
+            if doc_files_to_parse:
+                status.write(f"⚡️ 正在并行解析 {len(doc_files_to_parse)} 个文档...")
+                max_chars = st.session_state.config_max_chars
 
-            # [优化点 2] 使用带滚动条的容器预览文档内容
-            # height=300 表示固定高度 300px，内容多了内部滚动，不会拉长页面
+                # 使用线程池并发处理
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    # 提交任务
+                    future_to_file = {
+                        executor.submit(
+                            parse_file_safe,
+                            f['path'],
+                            f['name'],
+                            max_chars  # 这里传入每个文件的上限，防止单个文件爆内存
+                        ): f['name']
+                        for f in doc_files_to_parse
+                    }
+
+                    # 获取结果
+                    for future in as_completed(future_to_file):
+                        fname = future_to_file[future]
+                        try:
+                            result = future.result()
+                            # [安全截断] 累加前检查总长度
+                            if len(text_context) + len(result) > max_chars:
+                                status.warning(f"⚠️ 总文本量超限，文件 {fname} 及后续内容已截断。")
+                                text_context += result[:(max_chars - len(text_context))]
+                                break
+                            text_context += result
+                        except Exception as exc:
+                            logger.error(f"{fname} 解析异常: {exc}")
+
             if text_context:
-                with st.expander("👀 发送内容预览 (点击展开)"):
-                    with st.container(height=300):
+                with st.expander("👀 解析内容预览"):
+                    with st.container(height=200):
                         st.code(text_context, language="markdown")
 
-            final_query = prompt + text_context
+            # 3. [关键优化 2] 结构化 Prompt 拼接
+            # 使用 XML 标签明确区分“参考资料”和“用户指令”
+            final_query = prompt
+            if text_context:
+                final_query = f"""
+<context>
+{text_context}
+</context>
+
+<instruction>
+{prompt}
+</instruction>
+"""
+
+            # 4. 上传多媒体
             final_files_payload = []
             if media_files:
                 status.write("📤 上传多媒体...")
                 final_files_payload = st.session_state.bot.prepare_files_for_chat(media_files)
 
-            # === 发送请求 ===
+            # 5. 发送请求
             status.write("🧠 AI 思考中...")
             stream = st.session_state.bot.send_chat_message(
                 query=final_query,
                 conversation_id=st.session_state.conversation_id,
                 files=final_files_payload
             )
-
-            st.session_state.files_to_send = []
 
             for data in stream:
                 event = data.get('event')
@@ -190,18 +308,16 @@ if prompt := st.chat_input("请输入..."):
                 elif event == 'error':
                     st.error(data.get('message'))
 
-            # 完成状态
             status.update(label="完成", state="complete", expanded=False)
             placeholder.markdown(full_res)
+            st.session_state.messages.append({"role": "assistant", "content": full_res})
 
-            # [优化点 3] 生成完成后，立即显示一个复制按钮
+            # 显示复制按钮
             with st.expander("📄 复制全文", expanded=False):
                 st.code(full_res, language="markdown")
 
-            st.session_state.messages.append({"role": "assistant", "content": full_res})
-
             st.session_state.uploader_key += 1
-            time.sleep(0.5)  # 防止 DOM 刷新冲突
+            time.sleep(0.5)
             st.rerun()
 
         except Exception as e:
