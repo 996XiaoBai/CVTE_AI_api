@@ -1,12 +1,14 @@
-# mian.py
+# main.py
 import sys
 import time
 import os
 
 # 导入业务层
 from PageObject.dify_service import DifyService
+# 导入配置层 (新增)
+from conf.config import Config
 # 导入工具层
-from utils.logger import logger
+from utils.logger import logger, auto_clean_logs
 from utils.path_manager import PathManager
 
 
@@ -23,12 +25,54 @@ def clean_path(path_str):
     return path_str
 
 
-def main():
-    logger.info("=== 🤖 Dify 智能助手启动中... ===")
+def select_app_mode():
+    """
+    CLI 模式下的应用选择交互逻辑
+    """
+    # 防御性编程：如果没有配置 APP_MAP，直接返回 None (使用默认 Key)
+    if not hasattr(Config, 'APP_MAP') or not Config.APP_MAP:
+        return None
 
-    # 1. 实例化业务对象
+    print("\n🤖 可用的应用列表：")
+    app_list = list(Config.APP_MAP.items())
+
+    # 打印选项
+    for idx, (name, key) in enumerate(app_list):
+        print(f"   [{idx + 1}] {name}")
+    print(f"   [0] 使用默认配置")
+
+    # 循环等待用户输入有效选项
+    while True:
+        choice = input("\n请选择应用编号 (直接回车默认): ").strip()
+
+        # 默认情况
+        if not choice or choice == '0':
+            print("✅ 使用默认配置")
+            return None
+
+        # 校验输入
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(app_list):
+                selected_name, selected_key = app_list[idx]
+                print(f"✅ 已切换至: {selected_name}")
+                return selected_key
+
+        print("❌ 输入无效，请重试。")
+
+
+def main():
+    auto_clean_logs(7)
+    logger.info("=== 🤖 Dify 智能助手 (CLI版) 启动中... ===")
+
+    # 1. 让用户选择要使用的应用 (新增步骤)
+    selected_api_key = select_app_mode()
+
+    # 2. 实例化业务对象
     try:
-        bot = DifyService()
+        # 如果 selected_api_key 为 None，Service 内部会自动读取 Config.API_KEY
+        bot = DifyService(api_key=selected_api_key)
+
         # 获取应用信息作为连接测试
         app_info = bot.get_app_info()
         logger.info(f"✅ 已连接到应用: {app_info.get('name', 'Unknown')}")
@@ -45,7 +89,7 @@ def main():
     current_files_payload = []
 
     # ==========================================
-    # 📂 1. 静态配置加载 (启动时自动加载的文件)
+    # 📂 3. 静态配置加载 (启动时自动加载的文件)
     # ==========================================
     # 只要把文件放在根目录的 files/ 文件夹下，这里填文件名即可
     static_file_names = [
@@ -68,7 +112,7 @@ def main():
             logger.error(f"❌ 静态文件上传出错: {e}")
 
     # ==========================================
-    # 💬 对话循环
+    # 💬 4. 对话循环
     # ==========================================
     print("\n" + "=" * 60)
     print("💡 操作指南：")

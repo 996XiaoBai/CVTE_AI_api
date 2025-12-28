@@ -7,7 +7,7 @@ from typing import Generator, Dict, Any, List, Union, Optional
 # 导入底层 API 和日志工具
 from BasePage.base_api import BaseApiClient
 from utils.logger import logger
-
+from conf.config import Config
 
 class DifyService(BaseApiClient):
     """
@@ -15,6 +15,22 @@ class DifyService(BaseApiClient):
     封装所有具体的 API 调用逻辑，不包含 HTTP 底层细节
     """
 
+    def __init__(self, api_key: str = None):
+        super().__init__()  # 如果父类有初始化逻辑，先调用父类
+
+        # 1. 确定使用哪个 Key (传入的优先，否则用 Config 默认)
+        self.api_key = api_key if api_key else Config.API_KEY
+
+        # 2. 初始化基础参数
+        self.base_url = Config.API_BASE_URL
+        self.default_user = Config.USER_ID
+
+        # 3. 重新构造 Headers (关键步骤)
+        # BaseApiClient 通常会读取 self.headers，这里要覆盖它
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
     # Dify 支持的文件后缀映射表
     FILE_TYPE_MAPPING = {
         'image': ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.tiff'],

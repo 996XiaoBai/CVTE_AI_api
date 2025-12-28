@@ -3,13 +3,30 @@ import os
 
 class Config:
     # 基础配置
-    API_BASE_URL = "https://dify.cvte.com/v1"
 
+    API_BASE_URL = "https://dify.cvte.com/v1"
+    APP_MAP = {
+        "默认助手": "app-JhpoKtzMJBbcH78FHiIaKZ5f",
+        "测试用例生成": "app-iHi8BVqLX1lnCpWR8in2WMeS",
+        "测试方案设计": "app-k8owUIOUvQEqlWBorP2V0G2w",
+        "闲聊/摸鱼": "app-UxW6Ol6AwTOcOyIi6plVCIGS",
+        "需求分析专家": "app-7msqY1Qk6QctrBhgpDclFMAp"
+    }
+    API_KEY = APP_MAP["默认助手"]
     # 请填入你的 API Key
-    API_KEY = "app-JhpoKtzMJBbcH78FHiIaKZ5f"
+    #API_KEY = "app-JhpoKtzMJBbcH78FHiIaKZ5f"
+    #测试用例
+    # API_KEY = "app-iHi8BVqLX1lnCpWR8in2WMeS"
+    # 测试方案
+    # API_KEY = "app-k8owUIOUvQEqlWBorP2V0G2w"
+    #闲聊
+    # API_KEY = "app-UxW6Ol6AwTOcOyIi6plVCIGS"
+    #需求分析
+    # API_KEY = "app-7msqY1Qk6QctrBhgpDclFMAp"
+
 
     # 用户标识 (建议使用你的域账号)
-    USER_ID = "linkangbao"
+    USER_ID = "lifeng16527"
 
     # --- 新增配置 ---
     TIMEOUT = 30  # 请求超时时间
